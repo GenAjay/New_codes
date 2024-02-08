@@ -1,0 +1,456 @@
+---
+title: "PolyHaplotyper vignette"
+author: "Roeland E. Voorrips"
+date: "`r Sys.Date()`"
+output: rmarkdown::html_vignette
+vignette: >
+  %\VignetteIndexEntry{PolyHaplotyper vignette}
+  %\VignetteEngine{knitr::rmarkdown}
+  \usepackage[utf8]{inputenc}
+---
+
+# PolyHaplotyper vignette
+### Roeland E. Voorrips, `r Sys.Date()`
+
+This vignette shows how to use the main functions provided in R package
+PolyHaplotyper and explains their output.
+
+The PolyHaplotyper package contains tools to derive phased haplotypes from
+unphased bi-allelic marker (SNP) data in collections of individuals of
+any even ploidy level: diploid, tetraploid, hexaploid. The haplotyping
+does not rely on linkage mapping and often is very fast (within a few seconds
+per haploblock).
+
+The markers must have been grouped into "haploblocks" that are so tightly
+linked that recombination may be assumed not to occur within the population.
+Typically such a haploblock would be the collection of all SNPs within a
+single contig. Since the number of possible haplotypes and hence the
+computation time increases dramatically with increasing number of markers
+it is best to split larger haploblocks to a maximum of 7-8 markers 
+(in tetraploids) or 5-6 markers (in hexaploids).
+
+The haplotyping is more reliable if one or more FS (Full-Sib) families, 
+with parents, are present, but will also proceed if no such FS families
+are available, or if the parents have missing data.
+
+# Input data
+Load the package and demo data:
+```{r}
+rm(list=ls()) # clear existing data from memory
+library(PolyHaplotyper)
+data(PolyHaplotyper_demo) 
+# show the demo data:
+ls()
+```
+Two inputs are necessary for the assignment of haplotypes: a matrix or 
+data.frame with the dosages of the markers, and a list indicating which markers 
+belong to each haploblock. 
+If FS families are present, these and their parents must also be specified:
+the FS family as a list with for each family a vector of names of the
+FS individuals, and the parents as a matrix with two columns and one row for
+each FS family.
+Further, in order to test if the assigned haplotype
+combinations match between parents and progeny, a pedigree must be specified
+as a matrix or data.frame. The pedigree is not needed or used for the 
+haplotyping itself, only (optionally) for a check afterwards. This pedigree can
+also contain other individuals than those in the specified FS families.
+
+Each individual should be represented by one column in the marker dosage
+data. If a pedigree is supplied there should also be one row for each individual
+in the pedigree, and the individual names in the dosage data and pedigree must 
+correspond (the pedigree may contain extra individuals not present in the dosage
+data). If that is the case the rest of this 
+section can be skipped. However, in the demo data several individuals are
+replicated in the dosage data and the pedigree, and the columns of the dosage
+data are named by sample codes rather than individual names. Also the
+haploblocks are defined by an extra column in the dosage data,
+rather than by a list.
+
+Since these are likely to be common issues we show here how to obtain input data
+in the correct formats, using some tools from the PolyHaplotyper package.
+
+### Haploblock definitions
+The markers must be assigned to haploblocks which are stored as a list. In the 
+example the haploblock information is contained in an extra column "contig"
+in the marker dosage data:
+```{r}
+demo_snpdos[1:6, 1:8]
+```
+We convert the haploblock information to list format:
+```{r}
+hblist <- haploblock_df2list(demo_snpdos, mrkcol=1, hbcol=2)
+# number of markers in each haploblock:
+sapply(hblist, length)
+```
+This small example has data for 7 haploblocks, each with 4 or 5 markers.
+
+### Marker data
+The marker data must be supplied as a matrix or data.frame, with markers in
+rows and individuals in columns, with each cell containing the
+dosage (0 ... ploidy) of the target marker allele. Our data are in data.frame 
+demo_snpdos, which, as we saw above, contains an extra column "contig" defining
+the haploblocks. We remove the contig column from demo_snpdos to get it in the 
+required format:
+```{r}
+demo_snpdos <- demo_snpdos[, -2]
+demo_snpdos[1:6, 1:8]
+```
+
+The SNP dosages are all in the range 0...6, as these demo data are obtained 
+from a hexaploid crop (chrysanthemum). NA indicates an unknown dosage. 
+
+### Pedigree
+The pedigree must be a data.frame or matrix with in the first 3 columns the 
+names of the individual, its mother and its father. Parents
+may be missing (NA) but individuals may not, and there may not be more 
+than one line for the same individual.
+Additional columns may be present. In our case demo_ped has a fourth column 
+containing the sample nr:
+```{r}
+head(demo_ped)
+```
+In this example several individuals are represented by more than one line, 
+because here the pedigree is also used to specify the (sometimes duplicated) 
+samples for each individual.  
+In order to remove the duplicates from the pedigree we build 
+a list with the samples representing each replicated individual.
+```{r}
+# create a list of of replicates:
+tb <- table(demo_ped$genotype)
+replist <- list()
+for (dup in names(tb[tb>1])) {
+  replist[[dup]] <- demo_ped$sample_nr[demo_ped$genotype == dup]
+}
+```
+We remove the replicated individuals from the pedigree, keeping only the first
+row for each set of duplicates:
+```{r}
+dim(demo_ped)
+for (dup in seq_along(replist)) {
+  dupsamp <- as.character(replist[[dup]])[-1]
+  demo_ped <- demo_ped[!(demo_ped$sample_nr %in% dupsamp),]
+}
+dim(demo_ped)
+```
+We see that 30 lines containing duplicates have been discarded.
+
+In demo_snpdos, the data.frame containing the SNP dosages, the column names are
+the sample names, and duplicated samples are still present. First we merge the
+dosage data of the replicates for each individual, again using replist (the list
+of replicates):
+```{r}
+# merge all the duplicated samples:
+dim(demo_snpdos)
+demo_snpdos <- mergeReplicates(mrkDosage=demo_snpdos, replist=replist,
+                               solveConflicts=TRUE)
+dim(demo_snpdos)
+```
+Function mergeReplicates has converted the demo_snpdos data.frame to a matrix,
+with the rownames taken from the column "marker". For each individual present
+in multiple replicates only the first column name is retained, and the
+merged data are the consensus scores over all replicates. We see that 
+demo_snpdos now has 31 less columns: 1 was the removed "marker" column and
+30 were columns for the duplicated samples, corresponding to the 30
+duplicates removed from the pedigree.  
+
+Now we must change the sample numbers to the corresponding individual names:
+```{r}
+colnames(demo_snpdos) <- 
+  demo_ped$genotype[match(colnames(demo_snpdos), demo_ped$sample_nr)]
+
+```
+
+
+
+
+## FS families
+Finally we specify the four FS families and their parents (note that 
+individual 39287 is the father of two FS families):
+```{r}
+parents <- cbind(c(36451, 41234, 9656, 32141),
+                 c(39287, 40360, 9541, 39287))
+parents
+# find the FS individuals by looking in the pedigree for their mother and father:
+FS <- list()
+for (p in seq_len(nrow(parents))) {
+  FS[[p]] <- 
+    demo_ped$genotype[!is.na(demo_ped$mother) & demo_ped$mother==parents[p, 1] &
+                      !is.na(demo_ped$father) & demo_ped$father==parents[p, 2]]
+}
+# sizes of the FS families:
+sapply(FS, length)
+```
+
+
+# Haplotyping
+Now we have the input data for the haplotyping in the correct formats. 
+To perform the haplotyping for all haploblocks in one go we use function
+inferHaplotypes:
+
+```{r results="hide"}
+results <- inferHaplotypes(mrkDosage=demo_snpdos, ploidy=6,
+                           haploblock=hblist,
+                           parents=parents, FS=FS)
+```
+We assume here that you run this command in a directory
+that does not contain file ahclist_6x.RData or ahccompletelist_6x.RData (more
+about these files in section Remarks).  
+The first output line says that ahccompletelist cannot be loaded. Then you
+will get messages about sets of haplotype combinations that need to be 
+calculated. These would normally be available from the ahccompletelist file,
+but failing that they are calculated as needed. For this small example this 
+will take about 1 min. When this is done the actual haplotyping is
+done, and again progress messages are shown.  
+
+This function call returns a list with one item for each haploblock. 
+Each of these items is itself a list with several items. We'll take a look at 
+the results for the first haploblock which are in results[[1]].  
+The actual haplotyping is in item hapdos (for "haplotype dosages"). 
+The composition of the haplotypes used in any of the individuals can be obtained
+via the usedhap function, and a listing of all possible haplotypes with the 
+allhap function.
+```{r}
+names(results[[1]])
+# show part of hapdos: the dosages of the haplotypes, for the first haploblock:
+results[[1]]$hapdos[, 1:8]
+# show the composition of the used haplotypes:
+usedhap(results[[1]])
+# show the composition of all possible haplotypes:
+allhap(results[[1]])
+```
+Haploblock 1 has 4 SNPs, so there are 16 (2^4) possible haplotypes. These are
+all listed in the matrix returned by allhap, with a 0 indicating the non-counted
+(reference) SNP allele and a 1 the dosage-counted (alternative) allele. In
+haploblocks with more markers there will be many more columns, so 
+function usedhap is often more useful; this shows only the haplotypes that 
+are present in at least one individual.
+
+Matrix hapdos has the dosages of each haplotype in each individual, in the same
+layout as the marker dosages in demo_snpdos. Only the haplotypes that occur in
+the population are shown: in this case haplotypes 1, 3, 7, 8 and 11 (appended to 
+the haploblock name). For each individual the haplotype dosages sum to the 
+ploidy (6). Non-haplotyped individuals have NA dosages for all haplotypes.
+
+Another interesting item in the results is imputedGenotypes. For some FS
+individuals that have missing data in the marker genotypes it is still possible
+to infer their haplotype composition, and from this follow the complete marker 
+dosages. Below we see these imputed marker dosages compared with the original 
+dosages:
+
+```{r}
+results[[1]]$imputedGeno[, 1:8]
+demo_snpdos[hblist[[1]], colnames(results[[1]]$imputedGeno)[1:8]]
+```
+
+The other items in the results for each haploblock are mostly intended for 
+generating overviews and statistics as shown in the next section. Refer to the
+manual (?inferHaplotypes) for an explanation of all items.
+
+# Overviews and statistics
+### Overviews by FS family
+The results of the haplotyping are now in a list named results. We first
+see how well the different FS families have been haplotyped, using function 
+overviewByFS:
+```{r}
+ovwFS <- overviewByFS(haploblock=hblist, parents=parents, FS=FS,
+                      hapresults=results)
+# The full table is too wide to show;
+# for FS family 1 the results are:
+knitr::kable(ovwFS$ovw[, 1: 8], digits=c(0,0,0,0,3,0,0,0))
+# the final columns for the non-FS individuals and all individuals:
+knitr::kable(ovwFS$ovw[, c(1:2, 27:31)])
+#
+```
+overviewByFS returns a list with two items: ovw and messages. Both are matrices
+with one row per haploblock. Matrix ovw first gives the number of markers (nmrk)
+and of assigned haplotypes (nhap) for the haploblock over all individuals, and then
+for each FS family specific information: parmrk (0, 1 or 2: the number of 
+parents with complete marker dosages), fit (1 if a polysomic segregation could
+be fitted, else 0), P (the chi-squared P-value of the best fitting segregation
+of haplotypes, even if this segregation was rejected), mrk (the number of 
+FS individuals with complete marker dosages), imp (the number of FS individuals
+for which marker dosages were imputed) and hap (the number of 
+FS individuals with an assigned haplotype combination). After the last
+FS family we have two columns for "rest" (all individuals that are not
+in the FS families or their parents) and three columns for "all" (all
+individuals), again with mrk, imp and hap indicating the number of individuals
+with complete marker data, with imputed marker genotypes and with assigned 
+haplotypes. See the help file for further details (?overviewByFS). 
+
+The second item in the OverviewByFS result, messages, is also a matrix with one 
+row per haploblock. It has first a message for the entire haploblock and
+then one message per FS family.
+
+### Pedigree check
+Next we check each individual for a match between the possible gametes of
+its parents and its own haplotype composition, using function 
+pedigreeHapdosCheck:
+```{r}
+pedchk <- pedigreeHapCheck(ped=demo_ped, mrkDosage=demo_snpdos,
+                           haploblock=hblist,
+                           hapresults=results)
+#show part of ped_arr for haploblock 1:
+knitr::kable(pedchk$ped_arr[1:8,,1])
+#show parents_arr for parents with more than 10 offspring and haploblock 1:
+knitr::kable(pedchk$parents_arr[pedchk$parents_arr[,3,1]>10,,1])
+#
+```
+pedigreeHapdosCheck returns a list with two items, the 3-dim arrays ped_arr 
+and parents_arr. In both cases the first dimension are individuals and the third
+dimension are haploblocks; the second dimension are the columns as shown above.
+
+Array ped_arr shows for each individual in the pedigree whether it
+has complete marker data (mrk), whether some of its marker dosages were 
+imputed (imp) and whether it has an assigned haplotype combination (hap), 
+and if its haplotype combination is compatible with that of its parents 
+assuming Double Reduction to be impossible (noDR) or possible (withDR); 
+NA indicates that the individual itself or both its parents have no 
+haplotypes assigned.  
+Array parents_arr gives information for each individual that is a parent,
+whether it has complete marker data (par_mrk) and an assigned haplotype 
+combination (par_hap), how many of its progeny have complete marker data (mrk)
+and haplotype data (hap), and how many of its progeny are compatible 
+with it, assuming Double Reduction to be impossible(nonDRmatch) or 
+possible (DRmatch). For details see the help (?pedigreeHapdosCheck).
+
+### Summary statistics
+The results of overviewByFS and pedigreeHapdosCheck can be summarized using
+function calcStatistics:
+```{r}
+cst <- calcStatistics(pedchk=pedchk, ovwFS=ovwFS)
+knitr::kable(cst$pedstats)
+knitr::kable(cst$FSstats, digits=c(0,0,0,2,2,2))
+#
+```
+calcStatistics returns a list with two matrices. Matrix pedstats gives per
+haploblock the totals over all individuals from pedchk\$ped_arr.
+The total of columns match.NA + noDR.TRUE + noDR.FALSE and 
+of match.NA + withDR.TRUE + withDR.FALSE is the total number of individuals.
+Matrix FSstats gives the totals or means per FS family over all haploblocks 
+from ovwFS\$ovw. For details see the help (?calcStatistics).
+
+### Number of markers vs number of haplotypes
+Finally we can get a table of the number of haplotypes vs the number of markers
+per haploblock:
+```{r}
+calcMrkHaptable(ovwFS=ovwFS)
+```
+In this example there are 5 haploblocks with 4 markers and 2 haploblocks with 5
+markers, so the table contains two rows.
+
+### Segregation in one FS, one haploblock
+With function showOneFS it is possible to study the segregation of one
+haploblock in one FS family. Both the segregation of markers and of 
+haplotypes is shown.
+
+```{r}
+# show the segregation for FS number 1 (FSnr=1) and 
+# haploblock number 1 (hbresults=results[[1]])
+showOneFS(FSnr=1, hbresults=results[[1]], mrkDosage=demo_snpdos, 
+          FS=FS, parents=parents)
+```
+The result of showOneFS is a list with 3 elements. The first two are matrices
+that show the segregation in terms of marker dosages and haplotype dosages, 
+respectively. The row names of these matrices are first "frq" (frequency,
+the number of FS individuals with each genotype) followed by the marker names
+or the haplotype names. The columns of both matrices are a bit  complex. The
+first two columns represent the parents. Their column names are the names of 
+the parents in (brackets), and their first row does not contain a frequency
+but the marker dosage IDs of the parents. All following columns have as names
+one of the marker dosage IDs occurring in the FS, and the first row has the 
+number of FS individuals with that marker dosage ID. (A marker dosage ID or
+mrkdid is a number encoding the dosages of all the SNP markers in an 
+individual). In all columns, the next rows contain the dosages of the markers 
+or the haplotypes.
+The third element of the result is a matrix listing the composition of the
+haplotypes present, in terms of their marker alleles (with a 0 being the
+reference allele and a 1 the alternative allele).
+
+# Remarks
+PolyHaplotyper uses one or two pre-calculated lists, ahclist and 
+ahccompletelist, that contain
+all possible haplotype combinations that result in the same marker
+dosage combination. These may take a lot of time to calculate and are completely
+reusable between haploblocks and runs of inferHaplotypes.
+
+The ahclist and ahccompletelist lists are stored 
+as files with names like ahclist_6x.RData and ahccompletelist_6x.RData (where
+6x indicates the ploidy). These files must be either in the working
+directory, or their location must be specified in the call to inferHaplotypes 
+by setting parameter ahcdir. If these files are not present the haplotyping
+will proceed normally, but the computation of the ahc data will add very
+much to the processing time; a message to that effect will be shown.
+
+An ahccompletelist stores the possible haplotype
+combinations for ALL marker dosage combinations, for haploblocks from 1 marker
+up to some maximum. These lists are pre-calculated: they
+are only used but not changed by inferHaplotypes. They speed up the 
+calculations enormously, but it takes considerable time to calculate them
+and above 7 or 8 markers (in tetraploids) or 6 markers (in hexaploids) they
+become too large. They are useful if haplotyping is a recurrent activity.
+
+An ahclist stores the haplotype combinations for any marker dosage
+combination that is encountered in the data, and that cannot be found in the
+ahccompletelist (because that list is not available, or is limited to haploblocks
+with fewer markers). These lists are created or extended "on the fly" and 
+then (re-)saved to file.
+
+The package does not include ahclist or ahccompletelist files because of their size. 
+The demo in this vignette doesn't need them as the number of haploblocks 
+is small and the calculation of the ahclist data requires little time. 
+After running the vignette example you will find file ahclist_6x.RData in the
+working directory.
+
+The ahccompletelist files can be computed using function build_ahccompletelist:
+
+```{r eval=FALSE}
+build_ahccompletelist(ploidy=6, maxmrk=5, overwrite=FALSE)
+```
+
+
+Alternatively the following ahccompletelists are (currently) available upon 
+request from roeland.voorrips@wur.nl:  
+ploidy 4, up to 7 markers: ahccompletelist_4x.RData, 41 MB  
+ploidy 4, up to 8 markers: ahccompletelist_4x.RData, 769 MB  
+ploidy 6, up to 5 markers: ahccompletelist_6x.RData, 9 MB  
+ploidy 6, up to 6 markers: ahccompletelist_6x.RData, 515 MB
+
+For those interested in some background on these lists:
+
+An ahclist for a given ploidy has one item for each number of markers per 
+haploblock (nmrk).  
+Such an item is itself a list, with one item for each marker dosage combination 
+for which the set of haplotype combinations has been calculated. The name of 
+such an item is the mrkdid (marker dosage ID) and the item contains a matrix
+with (ploidy) rows and one column per possible haplotype combination, 
+with the numbers of the haplotypes that are present (e.g. a column with numbers 
+1, 17, 17, 24 means that haplotypes 1 and 24 are present in simplex and 
+haplotype 17 is present in duplex, in this tetraploid combination).
+The order of the mrkdid items in the sublist for a certain number of markers is 
+the order in which they are calculated, and they are accessed by 
+their name (mrkdid).
+
+An ahccompletelist is very similar, except that for each number of markers
+it contains all possible marker dosage combinations (mrkdids) in a fixed
+order. They are accessed by their position and not by their name (mrkdid).
+Therefore they don't have or need the mrkdids as names.
+
+The following tables show the total number of
+haplotype combinations and the total number of combinations of marker
+dosages for a range of marker numbers (in rows) and ploidy 
+levels (in columns):
+```{r echo=FALSE}
+maxmrk <- 8
+maxploidy <- 8
+nhapcomb <- matrix(totHapcombCount(ploidy=rep(1:maxploidy, each=maxmrk), 
+                                   nmrk=rep(1:maxmrk, maxploidy)),
+                   ncol=maxploidy,
+                   dimnames=list(nmrk=1:maxmrk, ploidy=1:maxploidy))
+nmrkcomb <- matrix((rep(1:maxploidy, each=maxmrk)+1)^rep(1:maxmrk, maxploidy),
+                   ncol=maxploidy,
+                   dimnames=list(nmrk=1:maxmrk, ploidy=1:maxploidy))
+knitr::kable(nhapcomb, caption="haplotype combinations", row.names=TRUE)
+knitr::kable(nmrkcomb, caption="combinations of marker dosages", row.names=TRUE)
+#
+```
+
